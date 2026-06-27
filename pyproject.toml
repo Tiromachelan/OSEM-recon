@@ -1,0 +1,11 @@
+[project]
+name = "osem-recon"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.0",
+    "pytomography>=3.4.0",
+    "torch>=2.12.1",
+]
