@@ -1,0 +1,300 @@
+"""
+Reconstruction Orientation Tool
+================================
+
+A small Tkinter GUI for re-orienting a reconstructed SPECT volume and saving it
+back out. You can:
+
+  * load a raw float32 volume (e.g. reconstruction.raw),
+  * view it as slices (with a slider) or as a maximum-intensity projection,
+  * choose the viewing plane (axial / coronal / sagittal),
+  * rotate and flip the *volume* (not just the picture), and
+  * save the re-oriented volume to a new file.
+
+Rotate/flip act on the 3-D array, so what you save matches what you see.
+
+Run:
+    python orient_gui.py [volume.raw]
+
+Requires: numpy, matplotlib, and tkinter (bundled with the uv-managed Python
+on macOS; on Debian/Ubuntu install `python3-tk`).
+"""
+
+import os
+import sys
+import numpy as np
+
+# --- Viewing planes -------------------------------------------------------
+# For each plane we record the volume axis we look ALONG (proj_axis) and the
+# two in-plane axes shown as (horizontal, vertical). Volume axes are
+# (0, 1, 2) = (x, y, z) = (transaxial, transaxial, axial) in pytomography order.
+VIEWS = {
+    "Axial   (look along z)":    {"proj": 2, "h": 0, "v": 1},
+    "Coronal (look along y)":    {"proj": 1, "h": 0, "v": 2},
+    "Sagittal(look along x)":    {"proj": 0, "h": 1, "v": 2},
+}
+
+
+# --- Pure volume transforms (no GUI; unit-testable) -----------------------
+def flip_volume(vol: np.ndarray, axis: int) -> np.ndarray:
+    """Mirror the volume along ``axis``."""
+    return np.ascontiguousarray(np.flip(vol, axis=axis))
+
+
+def rotate_volume(vol: np.ndarray, h_axis: int, v_axis: int, k: int = 1) -> np.ndarray:
+    """Rotate the volume 90*k degrees in the plane spanned by (h_axis, v_axis).
+
+    Positive ``k`` rotates from the horizontal axis toward the vertical axis
+    (counter-clockwise as displayed with origin at lower-left).
+    """
+    return np.ascontiguousarray(np.rot90(vol, k=k, axes=(h_axis, v_axis)))
+
+
+def view_image(vol: np.ndarray, view: dict, mip: bool, index: int) -> np.ndarray:
+    """Return the 2-D image (rows = vertical axis, cols = horizontal axis)."""
+    if mip:
+        slab = vol.max(axis=view["proj"])
+    else:
+        slab = np.take(vol, index, axis=view["proj"])
+    # `slab` keeps the two non-projection axes in ascending original order.
+    remaining = [a for a in (0, 1, 2) if a != view["proj"]]
+    # Map remaining axes to (vertical, horizontal) for display.
+    order = [remaining.index(view["v"]), remaining.index(view["h"])]
+    return np.transpose(slab, order)
+
+
+# --- GUI ------------------------------------------------------------------
+def build_app(root, initial_path: str | None = None):
+    """Construct the application UI on an existing Tk root and return the App.
+
+    Kept separate from ``launch_gui`` so the widget logic can be exercised in
+    tests without entering the Tk main loop.
+    """
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    class App:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("Reconstruction Orientation Tool")
+            self.vol = None
+            self.path = None
+
+            # ---- control panel ----
+            ctrl = ttk.Frame(root, padding=8)
+            ctrl.grid(row=0, column=0, sticky="ns")
+
+            ttk.Button(ctrl, text="Load volume…", command=self.on_load).grid(
+                row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
+            ttk.Label(ctrl, text="Shape (x,y,z):").grid(row=1, column=0, sticky="w")
+            self.shape_var = tk.StringVar(value="128,128,128")
+            ttk.Entry(ctrl, textvariable=self.shape_var, width=14).grid(
+                row=1, column=1, sticky="ew")
+
+            ttk.Separator(ctrl, orient="horizontal").grid(
+                row=2, column=0, columnspan=2, sticky="ew", pady=6)
+
+            ttk.Label(ctrl, text="View plane:").grid(row=3, column=0, columnspan=2, sticky="w")
+            self.view_var = tk.StringVar(value=list(VIEWS)[1])  # coronal default
+            view_box = ttk.Combobox(ctrl, textvariable=self.view_var,
+                                    values=list(VIEWS), state="readonly", width=20)
+            view_box.grid(row=4, column=0, columnspan=2, sticky="ew")
+            view_box.bind("<<ComboboxSelected>>", lambda e: self.on_view_change())
+
+            self.mip_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(ctrl, text="Maximum-intensity projection",
+                            variable=self.mip_var, command=self.on_mip_toggle).grid(
+                row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+            self.slice_label = ttk.Label(ctrl, text="Slice:")
+            self.slice_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            self.slice_var = tk.IntVar(value=0)
+            self.slider = ttk.Scale(ctrl, from_=0, to=1, orient="horizontal",
+                                    command=self.on_slide)
+            self.slider.grid(row=7, column=0, columnspan=2, sticky="ew")
+
+            ttk.Separator(ctrl, orient="horizontal").grid(
+                row=8, column=0, columnspan=2, sticky="ew", pady=6)
+
+            ttk.Label(ctrl, text="Re-orient volume:").grid(
+                row=9, column=0, columnspan=2, sticky="w")
+            ttk.Button(ctrl, text="⟲ Rotate CCW", command=lambda: self.rotate(+1)).grid(
+                row=10, column=0, sticky="ew")
+            ttk.Button(ctrl, text="⟳ Rotate CW", command=lambda: self.rotate(-1)).grid(
+                row=10, column=1, sticky="ew")
+            ttk.Button(ctrl, text="⇋ Flip horizontal", command=self.flip_h).grid(
+                row=11, column=0, columnspan=2, sticky="ew")
+            ttk.Button(ctrl, text="⇅ Flip vertical", command=self.flip_v).grid(
+                row=12, column=0, columnspan=2, sticky="ew")
+            ttk.Button(ctrl, text="↺ Reset to loaded", command=self.reset).grid(
+                row=13, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+            ttk.Separator(ctrl, orient="horizontal").grid(
+                row=14, column=0, columnspan=2, sticky="ew", pady=6)
+            ttk.Button(ctrl, text="Save volume…", command=self.on_save).grid(
+                row=15, column=0, columnspan=2, sticky="ew")
+
+            self.status = ttk.Label(ctrl, text="No volume loaded.", wraplength=190,
+                                    foreground="#555")
+            self.status.grid(row=16, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ctrl.columnconfigure(0, weight=1)
+            ctrl.columnconfigure(1, weight=1)
+
+            # ---- figure ----
+            self.fig = Figure(figsize=(6, 6))
+            self.ax = self.fig.add_subplot(111)
+            self.im = None
+            self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+            self.canvas.get_tk_widget().grid(row=0, column=1, sticky="nsew")
+            root.columnconfigure(1, weight=1)
+            root.rowconfigure(0, weight=1)
+
+            if initial_path and os.path.exists(initial_path):
+                self.load(initial_path)
+
+        # ---- data handling ----
+        def load(self, path):
+            try:
+                shape = tuple(int(s) for s in self.shape_var.get().split(","))
+                assert len(shape) == 3
+            except Exception:
+                messagebox.showerror("Bad shape", "Shape must be three ints, e.g. 128,128,128")
+                return
+            data = np.fromfile(path, dtype=np.float32)
+            if data.size != int(np.prod(shape)):
+                # Try to infer a cube.
+                n = round(data.size ** (1 / 3))
+                if n ** 3 == data.size:
+                    shape = (n, n, n)
+                    self.shape_var.set(f"{n},{n},{n}")
+                else:
+                    messagebox.showerror(
+                        "Size mismatch",
+                        f"{data.size} float32 values do not fit shape {shape}.")
+                    return
+            self.vol = data.reshape(shape)
+            self.vol0 = self.vol.copy()
+            self.path = path
+            self.on_view_change()
+            self.set_status(f"Loaded {os.path.basename(path)}  shape={self.vol.shape}")
+
+        def on_load(self):
+            p = filedialog.askopenfilename(
+                title="Load reconstruction",
+                filetypes=[("Raw float32", "*.raw"), ("NumPy", "*.npy"), ("All", "*.*")])
+            if p:
+                if p.endswith(".npy"):
+                    self.vol = np.load(p).astype(np.float32)
+                    self.vol0 = self.vol.copy()
+                    self.path = p
+                    self.shape_var.set(",".join(map(str, self.vol.shape)))
+                    self.on_view_change()
+                    self.set_status(f"Loaded {os.path.basename(p)}  shape={self.vol.shape}")
+                else:
+                    self.load(p)
+
+        def on_save(self):
+            if self.vol is None:
+                return
+            p = filedialog.asksaveasfilename(
+                title="Save re-oriented volume", defaultextension=".raw",
+                filetypes=[("Raw float32", "*.raw"), ("NumPy", "*.npy")])
+            if not p:
+                return
+            if p.endswith(".npy"):
+                np.save(p, self.vol.astype(np.float32))
+            else:
+                np.ascontiguousarray(self.vol, dtype=np.float32).tofile(p)
+            self.set_status(f"Saved {os.path.basename(p)}  shape={self.vol.shape}")
+
+        # ---- transforms ----
+        def _axes(self):
+            return VIEWS[self.view_var.get()]
+
+        def rotate(self, k):
+            if self.vol is None:
+                return
+            a = self._axes()
+            self.vol = rotate_volume(self.vol, a["h"], a["v"], k)
+            self.on_view_change()
+
+        def flip_h(self):
+            if self.vol is None:
+                return
+            self.vol = flip_volume(self.vol, self._axes()["h"])
+            self.draw()
+
+        def flip_v(self):
+            if self.vol is None:
+                return
+            self.vol = flip_volume(self.vol, self._axes()["v"])
+            self.draw()
+
+        def reset(self):
+            if self.vol is None:
+                return
+            self.vol = self.vol0.copy()
+            self.on_view_change()
+            self.set_status("Reset to loaded orientation.")
+
+        # ---- display ----
+        def on_view_change(self):
+            if self.vol is None:
+                return
+            n = self.vol.shape[self._axes()["proj"]]
+            self.slider.configure(to=n - 1)
+            mid = n // 2
+            self.slice_var.set(mid)
+            self.slider.set(mid)
+            self.draw()
+
+        def on_mip_toggle(self):
+            state = "disabled" if self.mip_var.get() else "normal"
+            self.slider.configure(state=state)
+            self.draw()
+
+        def on_slide(self, _val):
+            self.slice_var.set(int(float(_val)))
+            if not self.mip_var.get():
+                self.draw()
+
+        def draw(self):
+            if self.vol is None:
+                return
+            a = self._axes()
+            mip = self.mip_var.get()
+            idx = int(self.slice_var.get())
+            img = view_image(self.vol, a, mip, idx)
+            if self.im is None:
+                self.im = self.ax.imshow(img, origin="lower", cmap="magma")
+            else:
+                self.im.set_data(img)
+                self.im.set_extent((0, img.shape[1], 0, img.shape[0]))
+            self.im.set_clim(0, max(img.max(), 1e-9))
+            mode = "MIP" if mip else f"slice {idx}"
+            self.ax.set_title(f"{self.view_var.get().strip()} — {mode}")
+            self.ax.set_xlabel("horizontal"); self.ax.set_ylabel("vertical")
+            self.canvas.draw_idle()
+
+        def set_status(self, text):
+            self.status.configure(text=text)
+
+    return App(root)
+
+
+def launch_gui(initial_path: str | None = None):
+    """Create the window and run the Tk event loop."""
+    import tkinter as tk
+    root = tk.Tk()
+    build_app(root, initial_path)
+    root.geometry("980x680")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    launch_gui(sys.argv[1] if len(sys.argv) > 1 else "reconstruction.raw")
