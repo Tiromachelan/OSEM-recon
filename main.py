@@ -1,3 +1,28 @@
+"""
+OSEM reconstruction of a SPECT sinogram produced by the GATE simulation in
+"../Simulation Pipeline".
+
+Geometry (taken directly from gateSimQuadHead.py):
+  * 4 detector heads, 30 views each -> 120 projections total.
+      head 1: 0,3,...,87   head 2: 90,...,177
+      head 3: 180,...,267  head 4: 270,...,357   (3 deg step)
+    combineRawFiles.py concatenates the 4 heads in order, so the combined
+    sinogram angle order is simply 0,3,6,...,357.
+  * Orbit radius        : 40 cm  (= 400 mm)
+  * Detector            : 128 x 128 pixels
+  * Pixel spacing       : 2.21 mm * 2 = 4.42 mm   (add_digitizer spacing)
+
+The simulation writes the projections (ITK/MHD .raw, x varies fastest), so a
+flat reshape gives axes (angle, detector_y, detector_x). The gantry orbits
+about world-Z, and each head's initial rotation maps the detector y-axis onto
+world-Z. Hence detector_y is the *axial* direction and detector_x is the
+*transaxial* direction. pytomography expects projections ordered
+(angle, r=transaxial, z=axial), so we swap the two detector axes.
+
+Usage:
+    python main.py [sinogram.raw] [n_iters] [n_subsets]
+"""
+
 from pytomography.metadata.SPECT import SPECTObjectMeta, SPECTProjMeta
 from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.likelihoods import PoissonLogLikelihood
@@ -6,30 +31,85 @@ import numpy as np
 import torch
 import sys
 
-# Load data
-raw = np.fromfile(sys.argv[1], dtype=np.float32)
-projections = torch.tensor(raw.reshape(1, 120, 128, 128))
+# ---------------------------------------------------------------------------
+# Acquisition / detector parameters (must match the simulation)
+# ---------------------------------------------------------------------------
+N_PROJECTIONS = 120          # 4 heads x 30 views
+DETECTOR_SHAPE = (128, 128)  # (detector pixels per side)
+PIXEL_SPACING = 4.42         # mm, = 2.21 mm * 2
+ORBIT_RADIUS = 400.0         # mm, = 40 cm
+VOXEL_SIZE = PIXEL_SPACING   # mm; reconstruct on the detector-pixel grid
 
-# Metadata (from sim)
-object_meta = SPECTObjectMeta(dr=(4.42, 4.42, 4.42), shape=(128, 128, 64))
+# ---------------------------------------------------------------------------
+# Command-line arguments
+# ---------------------------------------------------------------------------
+sinogram_path = sys.argv[1] if len(sys.argv) > 1 else "example_sinogram.raw"
+n_iters = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+n_subsets = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 
-angles = np.concatenate([
-    np.linspace(0,   87,  30, endpoint=True),
-    np.linspace(90,  177, 30, endpoint=True),
-    np.linspace(180, 267, 30, endpoint=True),
-    np.linspace(270, 357, 30, endpoint=True),
-])
-proj_meta = SPECTProjMeta(angles=angles, radii=400.0, dr=(4.42, 4.42))
+# ---------------------------------------------------------------------------
+# Load the sinogram
+# ---------------------------------------------------------------------------
+raw = np.fromfile(sinogram_path, dtype=np.float32)
+expected = N_PROJECTIONS * DETECTOR_SHAPE[0] * DETECTOR_SHAPE[1]
+if raw.size != expected:
+    raise ValueError(
+        f"{sinogram_path} has {raw.size} float32 values but the configured "
+        f"geometry expects {expected} "
+        f"({N_PROJECTIONS} x {DETECTOR_SHAPE[0]} x {DETECTOR_SHAPE[1]})."
+    )
 
-# System matrix built from metadata
+# (angle, detector_y=axial, detector_x=transaxial) -> (angle, transaxial, axial)
+sinogram = raw.reshape(N_PROJECTIONS, DETECTOR_SHAPE[0], DETECTOR_SHAPE[1])
+sinogram = np.transpose(sinogram, (0, 2, 1))
+projections = torch.tensor(np.ascontiguousarray(sinogram))
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+# Object is reconstructed on a cubic grid. The transaxial dimensions (x, y)
+# must be equal (the object is rotated about its z-axis during projection) and
+# match the transaxial detector size; the z-axis matches the axial detector
+# size.
+object_meta = SPECTObjectMeta(
+    dr=(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE),
+    shape=(DETECTOR_SHAPE[1], DETECTOR_SHAPE[1], DETECTOR_SHAPE[0]),  # (x, y, z)
+)
+
+# Detector angle for every projection: 0, 3, ..., 357 degrees.
+angles = np.arange(N_PROJECTIONS) * (360.0 / N_PROJECTIONS)
+
+proj_meta = SPECTProjMeta(
+    projection_shape=DETECTOR_SHAPE,          # (transaxial, axial)
+    dr=(PIXEL_SPACING, PIXEL_SPACING),
+    angles=angles,
+    radii=np.full(N_PROJECTIONS, ORBIT_RADIUS),
+)
+
+# ---------------------------------------------------------------------------
+# System matrix (no attenuation / PSF modelling yet -- add transforms here)
+# ---------------------------------------------------------------------------
 system_matrix = SPECTSystemMatrix(
-    obj2obj_transforms=[],          # e.g. attenuation/PSF operators go here
+    obj2obj_transforms=[],   # e.g. attenuation / PSF operators go here
     proj2proj_transforms=[],
     object_meta=object_meta,
     proj_meta=proj_meta,
 )
 
-# OSEM
+# ---------------------------------------------------------------------------
+# OSEM reconstruction
+# ---------------------------------------------------------------------------
 likelihood = PoissonLogLikelihood(system_matrix, projections)
 algorithm = OSEM(likelihood)
-recon = algorithm(n_iters=4, n_subsets=8)  # shape: (1, 128, 128, 64)
+recon = algorithm(n_iters=n_iters, n_subsets=n_subsets)  # shape: (x, y, z)
+
+recon_np = recon.cpu().numpy().astype(np.float32)
+print(
+    f"Reconstruction complete: shape={tuple(recon_np.shape)} "
+    f"min={recon_np.min():.4g} max={recon_np.max():.4g} sum={recon_np.sum():.4g}"
+)
+
+# Save result next to the input sinogram.
+output_path = "reconstruction.raw"
+recon_np.tofile(output_path)
+print(f"Saved reconstruction to {output_path}")
