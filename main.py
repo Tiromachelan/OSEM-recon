@@ -27,6 +27,7 @@ from pytomography.metadata.SPECT import SPECTObjectMeta, SPECTProjMeta
 from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.likelihoods import PoissonLogLikelihood
 from pytomography.algorithms import OSEM
+from pytomography.callbacks import Callback
 import numpy as np
 import torch
 import sys
@@ -132,9 +133,19 @@ system_matrix = SPECTSystemMatrix(
 # ---------------------------------------------------------------------------
 # OSEM reconstruction
 # ---------------------------------------------------------------------------
+class ProgressCallback(Callback):
+    def __init__(self, n_iters, n_subsets):
+        self._n_iters = n_iters
+        self._n_subsets = n_subsets
+
+    def run(self, object, n_iter, n_subset):
+        if n_subset == self._n_subsets - 1:
+            print(f"Iteration {n_iter + 1}/{self._n_iters}")
+        return object
+
 likelihood = PoissonLogLikelihood(system_matrix, projections)
 algorithm = OSEM(likelihood)
-recon = algorithm(n_iters=n_iters, n_subsets=n_subsets)  # shape: (x, y, z)
+recon = algorithm(n_iters=n_iters, n_subsets=n_subsets, callback=ProgressCallback(n_iters, n_subsets))  # shape: (x, y, z)
 
 recon_np = recon.cpu().numpy().astype(np.float32)
 print(
@@ -143,6 +154,6 @@ print(
 )
 
 # Save result next to the input sinogram.
-output_path = "reconstruction.raw"
+output_path = f"reconstruction_{n_iters}iters_{n_subsets}subsets.raw"
 recon_np.tofile(output_path)
 print(f"Saved reconstruction to {output_path}")
