@@ -41,6 +41,34 @@ ORBIT_RADIUS = 400.0         # mm, = 40 cm
 VOXEL_SIZE = PIXEL_SPACING   # mm; reconstruct on the detector-pixel grid
 
 # ---------------------------------------------------------------------------
+# Orientation conventions
+# ---------------------------------------------------------------------------
+# pytomography and other reconstruction programs (e.g. an external MLEM tool)
+# do not share a single coordinate convention, so the reconstructed volume can
+# come out rotated and/or mirrored relative to a reference. There are exactly
+# two *physical* degrees of freedom to reconcile; set them to match your
+# reference. Everything else (np.rot90/np.flip on the final image) is cosmetic
+# display orientation and does not change the physics.
+#
+#   TRANSPOSE_DETECTOR_AXES
+#       Which detector axis is axial vs transaxial. The GATE .raw is written
+#       x-fastest, giving (angle, detector_y, detector_x); the gantry orbits
+#       world-Z and each head's initial rotation maps detector_y -> world-Z,
+#       so detector_y is axial. pytomography wants (angle, transaxial, axial),
+#       hence we swap the two detector axes. Toggling this rotates the coronal
+#       view by 90 degrees.
+#
+#   REVERSE_GANTRY_SENSE
+#       The direction the gantry rotates. pytomography assumes one handedness;
+#       if the acquisition (or the other program) uses the opposite sense the
+#       volume is MIRRORED (patient left/right swapped). A mirror cannot be
+#       removed by any rotation, so this must be corrected here, at the source,
+#       not by flipping the displayed image. Implemented by flipping the
+#       transaxial detector axis (equivalent to negating the projection angles).
+TRANSPOSE_DETECTOR_AXES = True
+REVERSE_GANTRY_SENSE = False
+
+# ---------------------------------------------------------------------------
 # Command-line arguments
 # ---------------------------------------------------------------------------
 sinogram_path = sys.argv[1] if len(sys.argv) > 1 else "example_sinogram.raw"
@@ -59,9 +87,14 @@ if raw.size != expected:
         f"({N_PROJECTIONS} x {DETECTOR_SHAPE[0]} x {DETECTOR_SHAPE[1]})."
     )
 
-# (angle, detector_y=axial, detector_x=transaxial) -> (angle, transaxial, axial)
+# Raw layout is (angle, detector_y=axial, detector_x=transaxial).
 sinogram = raw.reshape(N_PROJECTIONS, DETECTOR_SHAPE[0], DETECTOR_SHAPE[1])
-sinogram = np.transpose(sinogram, (0, 2, 1))
+if TRANSPOSE_DETECTOR_AXES:
+    # -> (angle, transaxial, axial), the order pytomography expects.
+    sinogram = np.transpose(sinogram, (0, 2, 1))
+if REVERSE_GANTRY_SENSE:
+    # Flip the transaxial axis to invert rotational handedness (un-mirror).
+    sinogram = np.flip(sinogram, axis=2)
 projections = torch.tensor(np.ascontiguousarray(sinogram))
 
 # ---------------------------------------------------------------------------
